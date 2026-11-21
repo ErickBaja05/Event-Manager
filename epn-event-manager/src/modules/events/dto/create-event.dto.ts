@@ -6,4 +6,5 @@ export class CreateEventDto {
   description: string;
 
   payload: any;
+  query_term?: string;
 }
