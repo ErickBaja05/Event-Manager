@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { ObjectLiteral, Repository } from 'typeorm';
 import { CreateEventDto } from './dto/create-event.dto';
 import { CreateEventEntity } from '../../database/entities/create-event.entity';
 import { UpdateEventEntity } from '../../database/entities/update-event.entity';
@@ -141,16 +141,75 @@ export class EventsService {
     return this.collectEvents({ entity });
   }
 
+  /** Conteo agrupado por columna, sumando las 4 tablas (GROUP BY en SQL). */
+  private async countGroupedBy(
+    column: 'source' | 'entity',
+  ): Promise<Record<string, number>> {
+    const repos: Repository<ObjectLiteral>[] = [
+      this.createRepo,
+      this.updateRepo,
+      this.deleteRepo,
+      this.queryRepo,
+    ];
+    const totals: Record<string, number> = {};
+    for (const repo of repos) {
+      const rows = await repo
+        .createQueryBuilder('e')
+        .select(`e.${column}`, 'key')
+        .addSelect('COUNT(*)', 'count')
+        .groupBy(`e.${column}`)
+        .getRawMany<{ key: string | null; count: string | number }>();
+      for (const row of rows) {
+        const key = row.key ?? '(sin valor)';
+        totals[key] = (totals[key] ?? 0) + Number(row.count);
+      }
+    }
+    return totals;
+  }
+
+  /** Ultimo evento de cada tabla (mayor id) y se elige el mas reciente. */
+  private async findLastEvent(): Promise<NormalizedEvent | null> {
+    const order = { id: 'DESC' as const };
+    const [create, update, del, query] = await Promise.all([
+      this.createRepo.findOne({ where: {}, order }),
+      this.updateRepo.findOne({ where: {}, order }),
+      this.deleteRepo.findOne({ where: {}, order }),
+      this.queryRepo.findOne({ where: {}, order }),
+    ]);
+    const candidates: NormalizedEvent[] = [];
+    if (create) candidates.push(normalizeEvent({ ...create }, 'create_events'));
+    if (update) candidates.push(normalizeEvent({ ...update }, 'update_events'));
+    if (del) candidates.push(normalizeEvent({ ...del }, 'delete_events'));
+    if (query) candidates.push(normalizeEvent({ ...query }, 'query_events'));
+    if (candidates.length === 0) {
+      return null;
+    }
+    return candidates.sort(compareByDate)[candidates.length - 1];
+  }
+
   async getStats(): Promise<object> {
-    const createCount = await this.createRepo.count();
-    const updateCount = await this.updateRepo.count();
-    const deleteCount = await this.deleteRepo.count();
-    // Incidencia perfectiva: query_events no se incluye en el total
+    const [createCount, updateCount, deleteCount, queryCount] =
+      await Promise.all([
+        this.createRepo.count(),
+        this.updateRepo.count(),
+        this.deleteRepo.count(),
+        this.queryRepo.count(),
+      ]);
+    const [bySource, byEntity, lastEvent] = await Promise.all([
+      this.countGroupedBy('source'),
+      this.countGroupedBy('entity'),
+      this.findLastEvent(),
+    ]);
+
     return {
       create: createCount,
       update: updateCount,
       delete: deleteCount,
-      total: createCount + updateCount + deleteCount,
+      query: queryCount,
+      total: createCount + updateCount + deleteCount + queryCount,
+      by_source: bySource,
+      by_entity: byEntity,
+      last_event: lastEvent,
     };
   }
 }
