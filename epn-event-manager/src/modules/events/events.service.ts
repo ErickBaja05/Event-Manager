@@ -1,11 +1,16 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { ObjectLiteral, Repository } from 'typeorm';
 import { CreateEventDto } from './dto/create-event.dto';
 import { CreateEventEntity } from '../../database/entities/create-event.entity';
 import { UpdateEventEntity } from '../../database/entities/update-event.entity';
 import { DeleteEventEntity } from '../../database/entities/delete-event.entity';
 import { QueryEventEntity } from '../../database/entities/query-event.entity';
+import {
+  compareByDate,
+  NormalizedEvent,
+  normalizeEvent,
+} from './event-normalizer';
 
 @Injectable()
 export class EventsService {
@@ -88,61 +93,123 @@ export class EventsService {
     );
   }
 
-  async findAll(): Promise<object[]> {
-    // Incidencia perfectiva: agrega 4 tablas en memoria sin orden garantizado
-    const creates = await this.createRepo.find();
-    const updates = await this.updateRepo.find();
-    const deletes = await this.deleteRepo.find();
-    const queries = await this.queryRepo.find();
+  /**
+   * Mantenimiento perfectivo: unica via de lectura sobre las 4 tablas.
+   * Lee cada tabla (opcionalmente filtrada), normaliza con el helper comun y
+   * ordena cronologicamente de forma real.
+   */
+  private async collectEvents(
+    where: { source?: string; entity?: string } = {},
+  ): Promise<NormalizedEvent[]> {
+    const [creates, updates, deletes, queries] = await Promise.all([
+      this.createRepo.find({ where }),
+      this.updateRepo.find({ where }),
+      this.deleteRepo.find({ where }),
+      this.queryRepo.find({ where }),
+    ]);
 
-    // Ordena lexicograficamente por strings de fecha heterogeneos (incorrecto)
-    const merged = [
-      ...creates.map((e) => ({ ...e, _table: 'create_events' })),
-      ...updates.map((e) => ({ ...e, _table: 'update_events' })),
-      ...deletes.map((e) => ({ ...e, _table: 'delete_events' })),
-      ...queries.map((e) => ({ ...e, _table: 'query_events' })),
-    ];
+    return [
+      ...creates.map((e) => normalizeEvent({ ...e }, 'create_events')),
+      ...updates.map((e) => normalizeEvent({ ...e }, 'update_events')),
+      ...deletes.map((e) => normalizeEvent({ ...e }, 'delete_events')),
+      ...queries.map((e) => normalizeEvent({ ...e }, 'query_events')),
+    ].sort(compareByDate);
+  }
 
-    merged.sort((a, b) => {
-      const ra = a as unknown as Record<string, string>;
-      const rb = b as unknown as Record<string, string>;
-      const ta =
-        ra.recorded_at ?? ra.timestamp ?? ra.createdAt ?? ra.event_date ?? '';
-      const tb =
-        rb.recorded_at ?? rb.timestamp ?? rb.createdAt ?? rb.event_date ?? '';
-      return ta.localeCompare(tb);
-    });
-
-    return merged;
+  /**
+   * Historial completo. Sin `limit`/`page` devuelve todo (contrato original);
+   * con ellos devuelve solo la pagina pedida junto al total.
+   */
+  async findAll(
+    pagination: { limit?: number; page?: number } = {},
+  ): Promise<{ items: NormalizedEvent[]; total: number }> {
+    const all = await this.collectEvents();
+    if (pagination.limit === undefined && pagination.page === undefined) {
+      return { items: all, total: all.length };
+    }
+    const limit = pagination.limit ?? 20;
+    const page = pagination.page ?? 1;
+    const start = (page - 1) * limit;
+    return { items: all.slice(start, start + limit), total: all.length };
   }
 
   async findBySource(source: string): Promise<object[]> {
-    const creates = await this.createRepo.findBy({ source });
-    const updates = await this.updateRepo.findBy({ source });
-    const deletes = await this.deleteRepo.findBy({ source });
-    const queries = await this.queryRepo.findBy({ source });
-    return [...creates, ...updates, ...deletes, ...queries];
+    return this.collectEvents({ source });
   }
 
   async findByEntity(entity: string): Promise<object[]> {
-    // Incidencia preventiva: parametro entity usado directamente sin sanitizar
-    const creates = await this.createRepo.findBy({ entity });
-    const updates = await this.updateRepo.findBy({ entity });
-    const deletes = await this.deleteRepo.findBy({ entity });
-    const queries = await this.queryRepo.findBy({ entity });
-    return [...creates, ...updates, ...deletes, ...queries];
+    return this.collectEvents({ entity });
+  }
+
+  /** Conteo agrupado por columna, sumando las 4 tablas (GROUP BY en SQL). */
+  private async countGroupedBy(
+    column: 'source' | 'entity',
+  ): Promise<Record<string, number>> {
+    const repos: Repository<ObjectLiteral>[] = [
+      this.createRepo,
+      this.updateRepo,
+      this.deleteRepo,
+      this.queryRepo,
+    ];
+    const totals: Record<string, number> = {};
+    for (const repo of repos) {
+      const rows = await repo
+        .createQueryBuilder('e')
+        .select(`e.${column}`, 'key')
+        .addSelect('COUNT(*)', 'count')
+        .groupBy(`e.${column}`)
+        .getRawMany<{ key: string | null; count: string | number }>();
+      for (const row of rows) {
+        const key = row.key ?? '(sin valor)';
+        totals[key] = (totals[key] ?? 0) + Number(row.count);
+      }
+    }
+    return totals;
+  }
+
+  /** Ultimo evento de cada tabla (mayor id) y se elige el mas reciente. */
+  private async findLastEvent(): Promise<NormalizedEvent | null> {
+    const order = { id: 'DESC' as const };
+    const [create, update, del, query] = await Promise.all([
+      this.createRepo.findOne({ where: {}, order }),
+      this.updateRepo.findOne({ where: {}, order }),
+      this.deleteRepo.findOne({ where: {}, order }),
+      this.queryRepo.findOne({ where: {}, order }),
+    ]);
+    const candidates: NormalizedEvent[] = [];
+    if (create) candidates.push(normalizeEvent({ ...create }, 'create_events'));
+    if (update) candidates.push(normalizeEvent({ ...update }, 'update_events'));
+    if (del) candidates.push(normalizeEvent({ ...del }, 'delete_events'));
+    if (query) candidates.push(normalizeEvent({ ...query }, 'query_events'));
+    if (candidates.length === 0) {
+      return null;
+    }
+    return candidates.sort(compareByDate)[candidates.length - 1];
   }
 
   async getStats(): Promise<object> {
-    const createCount = await this.createRepo.count();
-    const updateCount = await this.updateRepo.count();
-    const deleteCount = await this.deleteRepo.count();
-    // Incidencia perfectiva: query_events no se incluye en el total
+    const [createCount, updateCount, deleteCount, queryCount] =
+      await Promise.all([
+        this.createRepo.count(),
+        this.updateRepo.count(),
+        this.deleteRepo.count(),
+        this.queryRepo.count(),
+      ]);
+    const [bySource, byEntity, lastEvent] = await Promise.all([
+      this.countGroupedBy('source'),
+      this.countGroupedBy('entity'),
+      this.findLastEvent(),
+    ]);
+
     return {
       create: createCount,
       update: updateCount,
       delete: deleteCount,
-      total: createCount + updateCount + deleteCount,
+      query: queryCount,
+      total: createCount + updateCount + deleteCount + queryCount,
+      by_source: bySource,
+      by_entity: byEntity,
+      last_event: lastEvent,
     };
   }
 }
