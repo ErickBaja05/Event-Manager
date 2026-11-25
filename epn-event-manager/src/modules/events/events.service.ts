@@ -6,6 +6,11 @@ import { CreateEventEntity } from '../../database/entities/create-event.entity';
 import { UpdateEventEntity } from '../../database/entities/update-event.entity';
 import { DeleteEventEntity } from '../../database/entities/delete-event.entity';
 import { QueryEventEntity } from '../../database/entities/query-event.entity';
+import {
+  compareByDate,
+  NormalizedEvent,
+  normalizeEvent,
+} from './event-normalizer';
 
 @Injectable()
 export class EventsService {
@@ -88,49 +93,52 @@ export class EventsService {
     );
   }
 
-  async findAll(): Promise<object[]> {
-    // Incidencia perfectiva: agrega 4 tablas en memoria sin orden garantizado
-    const creates = await this.createRepo.find();
-    const updates = await this.updateRepo.find();
-    const deletes = await this.deleteRepo.find();
-    const queries = await this.queryRepo.find();
+  /**
+   * Mantenimiento perfectivo: unica via de lectura sobre las 4 tablas.
+   * Lee cada tabla (opcionalmente filtrada), normaliza con el helper comun y
+   * ordena cronologicamente de forma real.
+   */
+  private async collectEvents(
+    where: { source?: string; entity?: string } = {},
+  ): Promise<NormalizedEvent[]> {
+    const [creates, updates, deletes, queries] = await Promise.all([
+      this.createRepo.find({ where }),
+      this.updateRepo.find({ where }),
+      this.deleteRepo.find({ where }),
+      this.queryRepo.find({ where }),
+    ]);
 
-    // Ordena lexicograficamente por strings de fecha heterogeneos (incorrecto)
-    const merged = [
-      ...creates.map((e) => ({ ...e, _table: 'create_events' })),
-      ...updates.map((e) => ({ ...e, _table: 'update_events' })),
-      ...deletes.map((e) => ({ ...e, _table: 'delete_events' })),
-      ...queries.map((e) => ({ ...e, _table: 'query_events' })),
-    ];
+    return [
+      ...creates.map((e) => normalizeEvent({ ...e }, 'create_events')),
+      ...updates.map((e) => normalizeEvent({ ...e }, 'update_events')),
+      ...deletes.map((e) => normalizeEvent({ ...e }, 'delete_events')),
+      ...queries.map((e) => normalizeEvent({ ...e }, 'query_events')),
+    ].sort(compareByDate);
+  }
 
-    merged.sort((a, b) => {
-      const ra = a as unknown as Record<string, string>;
-      const rb = b as unknown as Record<string, string>;
-      const ta =
-        ra.recorded_at ?? ra.timestamp ?? ra.createdAt ?? ra.event_date ?? '';
-      const tb =
-        rb.recorded_at ?? rb.timestamp ?? rb.createdAt ?? rb.event_date ?? '';
-      return ta.localeCompare(tb);
-    });
-
-    return merged;
+  /**
+   * Historial completo. Sin `limit`/`page` devuelve todo (contrato original);
+   * con ellos devuelve solo la pagina pedida junto al total.
+   */
+  async findAll(
+    pagination: { limit?: number; page?: number } = {},
+  ): Promise<{ items: NormalizedEvent[]; total: number }> {
+    const all = await this.collectEvents();
+    if (pagination.limit === undefined && pagination.page === undefined) {
+      return { items: all, total: all.length };
+    }
+    const limit = pagination.limit ?? 20;
+    const page = pagination.page ?? 1;
+    const start = (page - 1) * limit;
+    return { items: all.slice(start, start + limit), total: all.length };
   }
 
   async findBySource(source: string): Promise<object[]> {
-    const creates = await this.createRepo.findBy({ source });
-    const updates = await this.updateRepo.findBy({ source });
-    const deletes = await this.deleteRepo.findBy({ source });
-    const queries = await this.queryRepo.findBy({ source });
-    return [...creates, ...updates, ...deletes, ...queries];
+    return this.collectEvents({ source });
   }
 
   async findByEntity(entity: string): Promise<object[]> {
-    // Incidencia preventiva: parametro entity usado directamente sin sanitizar
-    const creates = await this.createRepo.findBy({ entity });
-    const updates = await this.updateRepo.findBy({ entity });
-    const deletes = await this.deleteRepo.findBy({ entity });
-    const queries = await this.queryRepo.findBy({ entity });
-    return [...creates, ...updates, ...deletes, ...queries];
+    return this.collectEvents({ entity });
   }
 
   async getStats(): Promise<object> {
