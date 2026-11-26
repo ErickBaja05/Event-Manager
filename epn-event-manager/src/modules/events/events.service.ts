@@ -1,4 +1,8 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  InternalServerErrorException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { ObjectLiteral, Repository } from 'typeorm';
 import { CreateEventDto } from './dto/create-event.dto';
@@ -11,6 +15,8 @@ import {
   NormalizedEvent,
   normalizeEvent,
 } from './event-normalizer';
+
+export const MAX_PAYLOAD_BYTES = 65536; // 64 KB
 
 @Injectable()
 export class EventsService {
@@ -25,10 +31,73 @@ export class EventsService {
     private readonly queryRepo: Repository<QueryEventEntity>,
   ) {}
 
+  /**
+   * Mantenimiento preventivo: envuelve la persistencia en try-catch
+   * y lanza InternalServerErrorException con mensaje claro si SQLite falla.
+   */
+  private async persistEvent<T extends ObjectLiteral>(
+    repo: Repository<T>,
+    entity: T,
+  ): Promise<void> {
+    try {
+      await repo.save(entity);
+    } catch {
+      throw new InternalServerErrorException(
+        'Error al persistir el evento en la base de datos SQLite',
+      );
+    }
+  }
+
+  /**
+   * Mantenimiento preventivo: sanitiza y valida parametros de URL (:source, :entity)
+   * asegurando trim, longitud maxima y caracteres alfanumericos seguros.
+   */
+  validateIdentifier(name: 'source' | 'entity', value: string): string {
+    if (typeof value !== 'string') {
+      throw new BadRequestException(
+        `El parametro "${name}" debe ser una cadena de texto`,
+      );
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      throw new BadRequestException(
+        `El parametro "${name}" no puede estar vacio`,
+      );
+    }
+    if (trimmed.length > 64) {
+      throw new BadRequestException(
+        `El parametro "${name}" no puede exceder 64 caracteres`,
+      );
+    }
+    const validPattern = /^[a-zA-Z0-9_-]+$/;
+    if (!validPattern.test(trimmed)) {
+      throw new BadRequestException(
+        `El parametro "${name}" contiene caracteres no permitidos. Solo se permiten letras, numeros, guiones y guiones bajos`,
+      );
+    }
+    return trimmed;
+  }
+
   async registerEvent(dto: CreateEventDto): Promise<{ ok: boolean }> {
     const action = (dto.action ?? '').toUpperCase();
-    const payloadStr = JSON.stringify(dto.payload ?? {});
-    // Fecha guardada en formato local, no UTC (debilidad intencional)
+
+    // Mantenimiento preventivo: serializacion segura y control de tamano de payload
+    let payloadStr: string;
+    try {
+      payloadStr = JSON.stringify(dto.payload ?? {});
+    } catch {
+      throw new BadRequestException(
+        'El payload no es un JSON serializable valido',
+      );
+    }
+
+    if (Buffer.byteLength(payloadStr, 'utf8') > MAX_PAYLOAD_BYTES) {
+      throw new BadRequestException(
+        `El payload excede el tamano maximo permitido de ${MAX_PAYLOAD_BYTES} bytes (64 KB)`,
+      );
+    }
+
+    // Fecha guardada en formato UTC ISO 8601
     const utcDate = new Date().toISOString();
 
     if (action === 'CREATE') {
@@ -41,7 +110,7 @@ export class EventsService {
         payload: payloadStr,
         recorded_at: utcDate,
       });
-      await this.createRepo.save(ev);
+      await this.persistEvent(this.createRepo, ev);
       return { ok: true };
     }
 
@@ -55,7 +124,7 @@ export class EventsService {
         payload: payloadStr,
         timestamp: utcDate,
       });
-      await this.updateRepo.save(ev);
+      await this.persistEvent(this.updateRepo, ev);
       return { ok: true };
     }
 
@@ -69,7 +138,7 @@ export class EventsService {
         payload: payloadStr,
         createdAt: utcDate,
       });
-      await this.deleteRepo.save(ev);
+      await this.persistEvent(this.deleteRepo, ev);
       return { ok: true };
     }
 
@@ -84,7 +153,7 @@ export class EventsService {
         query_term: dto.query_term,
         event_date: utcDate,
       });
-      await this.queryRepo.save(ev);
+      await this.persistEvent(this.queryRepo, ev);
       return { ok: true };
     }
 
@@ -134,11 +203,13 @@ export class EventsService {
   }
 
   async findBySource(source: string): Promise<object[]> {
-    return this.collectEvents({ source });
+    const sanitized = this.validateIdentifier('source', source);
+    return this.collectEvents({ source: sanitized });
   }
 
   async findByEntity(entity: string): Promise<object[]> {
-    return this.collectEvents({ entity });
+    const sanitized = this.validateIdentifier('entity', entity);
+    return this.collectEvents({ entity: sanitized });
   }
 
   /** Conteo agrupado por columna, sumando las 4 tablas (GROUP BY en SQL). */
